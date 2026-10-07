@@ -1,0 +1,442 @@
+name: Deploy Next.js Dev
+
+on:
+  push:
+    branches:
+      - dev
+
+  workflow_dispatch:
+
+concurrency:
+  group: popsmagic-dev
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DEPLOY_HOST: ${{ secrets.DEV_HOST }}
+  DEPLOY_PORT: ${{ secrets.DEV_PORT }}
+  DEPLOY_USER: ${{ secrets.DEV_USER }}
+  DEPLOY_BASE_PATH: ${{ secrets.DEV_BASE_PATH }}
+
+  APP_NAME: popsmagic-next
+  APP_PORT: 3000
+
+jobs:
+  deploy:
+    name: Deploy Next.js
+    runs-on: ubuntu-24.04
+
+    timeout-minutes: 20
+
+    steps:
+
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+
+      # ============================================================
+      # DEPLOYMENT ID
+      # ============================================================
+
+      - name: Create Deployment ID
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEPLOY_ID="$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA::7}"
+
+          echo "DEPLOY_ID=$DEPLOY_ID" >> "$GITHUB_ENV"
+
+          echo "Deploy ID: $DEPLOY_ID"
+
+
+      # ============================================================
+      # SETUP SSH
+      # ============================================================
+
+      - name: Setup SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.DEV_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SSH_PRIVATE_KEY:-}" ]; then
+            echo "::error::DEV_SSH_KEY repository secret is missing."
+            exit 1
+          fi
+
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" \
+            | tr -d '\r' \
+            > "$HOME/.ssh/deploy_key"
+
+          chmod 600 "$HOME/.ssh/deploy_key"
+
+          if ! ssh-keygen \
+            -y \
+            -f "$HOME/.ssh/deploy_key" \
+            >/dev/null 2>&1
+          then
+            echo "::error::DEV_SSH_KEY is not a valid private key."
+            exit 1
+          fi
+
+          HOST_KEY_FILE="$HOME/.ssh/host_key"
+
+          rm -f "$HOST_KEY_FILE"
+
+          ssh-keyscan \
+            -4 \
+            -T 10 \
+            -p "$DEPLOY_PORT" \
+            -t ed25519 \
+            "$DEPLOY_HOST" \
+            > "$HOST_KEY_FILE" 2>/dev/null
+
+          if [ ! -s "$HOST_KEY_FILE" ]; then
+            echo "::error::Unable to retrieve SSH host key."
+            exit 1
+          fi
+
+          cp "$HOST_KEY_FILE" "$HOME/.ssh/known_hosts"
+
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+          cat > "$HOME/.ssh/config" <<EOF
+          Host popsmagic-dev
+              HostName ${DEPLOY_HOST}
+              Port ${DEPLOY_PORT}
+              User ${DEPLOY_USER}
+              IdentityFile ${HOME}/.ssh/deploy_key
+              IdentitiesOnly yes
+              BatchMode yes
+              PasswordAuthentication no
+              KbdInteractiveAuthentication no
+              StrictHostKeyChecking yes
+              UserKnownHostsFile ${HOME}/.ssh/known_hosts
+              ConnectTimeout 15
+              ServerAliveInterval 15
+              ServerAliveCountMax 3
+          EOF
+
+          chmod 600 "$HOME/.ssh/config"
+
+          echo "SSH setup PASS"
+
+
+      # ============================================================
+      # TEST SSH
+      # ============================================================
+
+      - name: Test SSH Connection
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh popsmagic-dev "echo 'SSH connection successful'"
+
+
+      # ============================================================
+      # PREPARE SERVER
+      # ============================================================
+
+      - name: Prepare Server
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh popsmagic-dev \
+            "BASE_PATH='$DEPLOY_BASE_PATH' bash -s" <<'REMOTE'
+
+          set -euo pipefail
+
+          echo "========================================"
+          echo "PREPARING NEXT.JS SERVER"
+          echo "========================================"
+
+          echo "Base path: $BASE_PATH"
+
+          mkdir -p "$BASE_PATH"
+
+          mkdir -p "$BASE_PATH/releases"
+
+          mkdir -p "$BASE_PATH/shared"
+
+          mkdir -p "$BASE_PATH/shared/.next"
+
+          echo "Server preparation PASS"
+
+          REMOTE
+
+
+      # ============================================================
+      # INSTALL NODE / PM2 CHECK
+      # ============================================================
+
+      - name: Verify Server Dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh popsmagic-dev <<'REMOTE'
+
+          set -euo pipefail
+
+          echo "Node:"
+          node -v
+
+          echo "NPM:"
+          npm -v
+
+          echo "PM2:"
+          pm2 -v
+
+          echo "Git:"
+          git --version
+
+          REMOTE
+
+
+      # ============================================================
+      # CREATE RELEASE
+      # ============================================================
+
+      - name: Create Release Directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh popsmagic-dev \
+            "BASE_PATH='$DEPLOY_BASE_PATH' DEPLOY_ID='$DEPLOY_ID' bash -s" <<'REMOTE'
+
+          set -euo pipefail
+
+          RELEASE_PATH="$BASE_PATH/releases/$DEPLOY_ID"
+
+          mkdir -p "$RELEASE_PATH"
+
+          echo "Release directory:"
+          echo "$RELEASE_PATH"
+
+          REMOTE
+
+
+      # ============================================================
+      # UPLOAD SOURCE
+      # ============================================================
+
+      - name: Upload Application
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rsync \
+            -az \
+            --delete \
+            --exclude=".git/" \
+            --exclude=".github/" \
+            --exclude=".env" \
+            --exclude=".env.*" \
+            --exclude="node_modules/" \
+            --exclude=".next/" \
+            --exclude="coverage/" \
+            -e "ssh -F $HOME/.ssh/config" \
+            ./ \
+            "popsmagic-dev:${DEPLOY_BASE_PATH}/releases/${DEPLOY_ID}/"
+
+          echo "Application upload PASS"
+
+
+      # ============================================================
+      # DEPLOY NEXT.JS
+      # ============================================================
+
+      - name: Build And Activate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh popsmagic-dev \
+            "BASE_PATH='$DEPLOY_BASE_PATH' DEPLOY_ID='$DEPLOY_ID' APP_NAME='$APP_NAME' APP_PORT='$APP_PORT' bash -s" <<'REMOTE'
+
+          set -euo pipefail
+
+          RELEASE_PATH="$BASE_PATH/releases/$DEPLOY_ID"
+          CURRENT_PATH="$BASE_PATH/current"
+          SHARED_PATH="$BASE_PATH/shared"
+
+          echo "========================================"
+          echo "NEXT.JS DEPLOYMENT"
+          echo "========================================"
+
+          echo "Release: $RELEASE_PATH"
+
+          cd "$RELEASE_PATH"
+
+
+          # ----------------------------------------------------------
+          # CHECK REQUIRED FILES
+          # ----------------------------------------------------------
+
+          test -f package.json || {
+            echo "ERROR: package.json missing."
+            exit 1
+          }
+
+
+          # ----------------------------------------------------------
+          # ENVIRONMENT
+          # ----------------------------------------------------------
+
+          if [ -f "$SHARED_PATH/.env" ]; then
+            ln -s "$SHARED_PATH/.env" "$RELEASE_PATH/.env"
+          fi
+
+          if [ -f "$SHARED_PATH/.env.production" ]; then
+            ln -s "$SHARED_PATH/.env.production" "$RELEASE_PATH/.env.production"
+          fi
+
+
+          # ----------------------------------------------------------
+          # INSTALL DEPENDENCIES
+          # ----------------------------------------------------------
+
+          echo "Installing dependencies..."
+
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+
+          # ----------------------------------------------------------
+          # BUILD
+          # ----------------------------------------------------------
+
+          echo "Building Next.js..."
+
+          npm run build
+
+
+          # ----------------------------------------------------------
+          # ACTIVATE RELEASE
+          # ----------------------------------------------------------
+
+          ln -sfn \
+            "$RELEASE_PATH" \
+            "$CURRENT_PATH"
+
+
+          # ----------------------------------------------------------
+          # PM2
+          # ----------------------------------------------------------
+
+          cd "$CURRENT_PATH"
+
+          if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
+
+            echo "Restarting existing PM2 application..."
+
+            pm2 restart "$APP_NAME" --update-env
+
+          else
+
+            echo "Starting new PM2 application..."
+
+            PORT="$APP_PORT" \
+            NODE_ENV=production \
+            pm2 start npm \
+              --name "$APP_NAME" \
+              -- start
+
+          fi
+
+
+          # ----------------------------------------------------------
+          # SAVE PM2
+          # ----------------------------------------------------------
+
+          pm2 save
+
+
+          # ----------------------------------------------------------
+          # HEALTH CHECK
+          # ----------------------------------------------------------
+
+          echo "Waiting for Next.js..."
+
+          sleep 5
+
+          if curl \
+            --fail \
+            --silent \
+            --show-error \
+            "http://127.0.0.1:${APP_PORT}" \
+            >/dev/null
+          then
+
+            echo "Health check PASS"
+
+          else
+
+            echo "Health check FAILED"
+
+            pm2 logs "$APP_NAME" \
+              --lines 50 \
+              --nostream || true
+
+            exit 1
+
+          fi
+
+
+          # ----------------------------------------------------------
+          # CLEAN OLD RELEASES
+          # ----------------------------------------------------------
+
+          echo "Cleaning old releases..."
+
+          cd "$BASE_PATH/releases"
+
+          ls -1dt */ 2>/dev/null \
+            | tail -n +6 \
+            | xargs -r rm -rf
+
+
+          echo
+          echo "========================================"
+          echo "DEPLOYMENT SUCCESS"
+          echo "========================================"
+
+          echo "Deploy ID: $DEPLOY_ID"
+          echo "Application: $APP_NAME"
+          echo "Port: $APP_PORT"
+
+          REMOTE
+
+
+      # ============================================================
+      # CLEANUP SSH
+      # ============================================================
+
+      - name: Cleanup SSH
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          rm -f \
+            "$HOME/.ssh/deploy_key" \
+            "$HOME/.ssh/host_key" \
+            "$HOME/.ssh/known_hosts" \
+            "$HOME/.ssh/config"
