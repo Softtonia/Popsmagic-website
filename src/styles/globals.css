@@ -1,0 +1,49 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --background: #faf6ee;
+    --foreground: #05382b;
+    --primary: #05382b;
+    --primary-foreground: #ffffff;
+  }
+
+  .dark {
+    --background: #121c18;
+    --foreground: #fafafa;
+    --primary: #10b981;
+    --primary-foreground: #ffffff;
+  }
+}
+
+.font-playfair {
+  font-family: var(--font-playfair), Georgia, Cambria, "Times New Roman", Times, serif;
+}
+
+/* Global 1360px container width override */
+.container {
+  max-width: 1360px !important;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* Left-to-Right Continuous Marquee Animation */
+@keyframes marquee-ltr {
+  0% {
+    transform: translateX(-50%);
+  }
+  100% {
+    transform: translateX(0%);
+  }
+}
+
+.animate-marquee-ltr {
+  display: flex;
+  width: max-content;
+  animation: marquee-ltr 22s linear infinite;
+}
+
+.animate-marquee-ltr:hover {
+  animation-play-state: paused !important;
+}
+
